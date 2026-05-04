@@ -44,7 +44,7 @@ class ConvLogicTreeLayer(torch.nn.Module):
         :param dilation:      convolution dilation
         :param device:        device for parameters and connection indices
         :param grad_factor:   gradient multiplier applied to the input
-        :param implementation: implementation to use (options: 'cuda' / 'python'). CUDA is forward-only for now.
+        :param implementation: implementation to use (options: 'cuda' / 'python')
         :param connections:   currently only 'random'
         :param residual_init: initialize gates toward the identity operation A
         """
@@ -133,12 +133,6 @@ class ConvLogicTreeLayer(torch.nn.Module):
     def forward_cuda(self, x):
         assert x.device.type == 'cuda', x.device
 
-        if self.training and torch.is_grad_enabled() and (x.requires_grad or self.weights.requires_grad):
-            raise RuntimeError(
-                'ConvLogicTreeLayer implementation="cuda" currently supports forward-only checks. '
-                'Use implementation="python" for training until CUDA backward is added.'
-            )
-
         x = x.contiguous()
         leaf_indices = self.leaf_indices.contiguous()
 
@@ -148,7 +142,7 @@ class ConvLogicTreeLayer(torch.nn.Module):
             weights = torch.nn.functional.one_hot(self.weights.argmax(-1), 16).to(x.dtype)
         weights = weights.contiguous()
 
-        return difflogic_cuda.conv_logic_tree_forward(
+        return ConvLogicTreeCudaFunction.apply(
             x,
             leaf_indices,
             weights,
@@ -184,6 +178,75 @@ class ConvLogicTreeLayer(torch.nn.Module):
             self.stride,
             self.padding,
         )
+
+
+########################################################################################################################
+
+
+class ConvLogicTreeCudaFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+            ctx,
+            x,
+            leaf_indices,
+            w,
+            kernel_h,
+            kernel_w,
+            stride_h,
+            stride_w,
+            padding_h,
+            padding_w,
+            dilation_h,
+            dilation_w,
+            tree_depth,
+    ):
+        ctx.save_for_backward(x, leaf_indices, w)
+        ctx.params = (
+            kernel_h,
+            kernel_w,
+            stride_h,
+            stride_w,
+            padding_h,
+            padding_w,
+            dilation_h,
+            dilation_w,
+            tree_depth,
+        )
+        return difflogic_cuda.conv_logic_tree_forward(
+            x,
+            leaf_indices,
+            w,
+            kernel_h,
+            kernel_w,
+            stride_h,
+            stride_w,
+            padding_h,
+            padding_w,
+            dilation_h,
+            dilation_w,
+            tree_depth,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_y):
+        x, leaf_indices, w = ctx.saved_tensors
+        grad_y = grad_y.contiguous()
+
+        grad_x = grad_w = None
+        if ctx.needs_input_grad[0] or ctx.needs_input_grad[2]:
+            grad_x_cuda, grad_w_cuda = difflogic_cuda.conv_logic_tree_backward(
+                x,
+                leaf_indices,
+                w,
+                grad_y,
+                *ctx.params,
+            )
+            if ctx.needs_input_grad[0]:
+                grad_x = grad_x_cuda
+            if ctx.needs_input_grad[2]:
+                grad_w = grad_w_cuda
+
+        return grad_x, None, grad_w, None, None, None, None, None, None, None, None, None
 
 
 ########################################################################################################################

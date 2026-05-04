@@ -55,6 +55,21 @@ torch::Tensor conv_logic_tree_cuda_forward(
     const int64_t dilation_w,
     const int64_t tree_depth
 );
+std::tuple<torch::Tensor, torch::Tensor> conv_logic_tree_cuda_backward(
+    torch::Tensor x,
+    torch::Tensor leaf_indices,
+    torch::Tensor w,
+    torch::Tensor grad_y,
+    const int64_t kernel_h,
+    const int64_t kernel_w,
+    const int64_t stride_h,
+    const int64_t stride_w,
+    const int64_t padding_h,
+    const int64_t padding_w,
+    const int64_t dilation_h,
+    const int64_t dilation_w,
+    const int64_t tree_depth
+);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
@@ -115,4 +130,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 tree_depth);
         },
         "convolutional logic tree forward (CUDA)");
+    m.def(
+        "conv_logic_tree_backward",
+        [](torch::Tensor x, torch::Tensor leaf_indices, torch::Tensor w, torch::Tensor grad_y,
+           const int64_t kernel_h, const int64_t kernel_w, const int64_t stride_h, const int64_t stride_w,
+           const int64_t padding_h, const int64_t padding_w, const int64_t dilation_h, const int64_t dilation_w,
+           const int64_t tree_depth) {
+            return conv_logic_tree_cuda_backward(
+                x,
+                leaf_indices,
+                w,
+                grad_y,
+                kernel_h,
+                kernel_w,
+                stride_h,
+                stride_w,
+                padding_h,
+                padding_w,
+                dilation_h,
+                dilation_w,
+                tree_depth);
+        },
+        "convolutional logic tree backward (CUDA)");
 }
