@@ -92,6 +92,170 @@ static inline __device__ float gpuAtomicAdd(float *address, float val) { return 
 static inline __device__ double gpuAtomicAdd(double *address, double val) { return atomicAdd(address, val); }
 
 
+/**********************************************************************************************************************/
+/**  CONVOLUTIONAL LOGIC TREE FORWARD  *******************************************************************************/
+/**********************************************************************************************************************/
+
+
+constexpr int MAX_CONV_LOGIC_TREE_LEAVES = 64;
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t bin_op_soft(const scalar_t a_, const scalar_t b_, const scalar_t *w_) {
+    return (
+         ((w_[1] * (a_ * b_)
+         + w_[2] * (a_ - a_ * b_))
+        + (w_[3] * a_
+         + w_[4] * (b_ - a_ * b_)))
+       + ((w_[5] * b_
+         + w_[6] * (a_ + b_ - static_cast<scalar_t>(2) * a_ * b_))
+        + (w_[7] * (a_ + b_ - a_ * b_)
+         + w_[8] * (static_cast<scalar_t>(1) - (a_ + b_ - a_ * b_)))))
+      + (((w_[9] * (static_cast<scalar_t>(1) - (a_ + b_ - static_cast<scalar_t>(2) * a_ * b_))
+         + w_[10] * (static_cast<scalar_t>(1) - b_)) +
+          (w_[11] * (static_cast<scalar_t>(1) - b_ + a_ * b_)
+         + w_[12] * (static_cast<scalar_t>(1) - a_))) +
+          (w_[13] * (static_cast<scalar_t>(1) - a_ + a_ * b_)
+         + w_[14] * (static_cast<scalar_t>(1) - a_ * b_)
+         + w_[15])
+    );
+}
+
+template <typename scalar_t>
+__global__ void conv_logic_tree_cuda_forward_kernel(
+    torch::PackedTensorAccessor64<scalar_t, 4, torch::RestrictPtrTraits> x,
+    torch::PackedTensorAccessor64<int64_t, 2, torch::RestrictPtrTraits> leaf_indices,
+    torch::PackedTensorAccessor64<scalar_t, 3, torch::RestrictPtrTraits> w,
+    torch::PackedTensorAccessor64<scalar_t, 4, torch::RestrictPtrTraits> y,
+    const int64_t kernel_h,
+    const int64_t kernel_w,
+    const int64_t stride_h,
+    const int64_t stride_w,
+    const int64_t padding_h,
+    const int64_t padding_w,
+    const int64_t dilation_h,
+    const int64_t dilation_w,
+    const int64_t tree_depth
+) {
+    const int64_t total = y.size(0) * y.size(1) * y.size(2) * y.size(3);
+    const int64_t out_w = y.size(3);
+    const int64_t out_h = y.size(2);
+    const int64_t out_channels = y.size(1);
+    const int64_t in_h = x.size(2);
+    const int64_t in_w = x.size(3);
+
+    for (int64_t linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
+         linear_idx < total;
+         linear_idx += blockDim.x * gridDim.x) {
+        const int64_t ow = linear_idx % out_w;
+        const int64_t oh = (linear_idx / out_w) % out_h;
+        const int64_t oc = (linear_idx / (out_w * out_h)) % out_channels;
+        const int64_t batch = linear_idx / (out_w * out_h * out_channels);
+
+        scalar_t values[MAX_CONV_LOGIC_TREE_LEAVES];
+        const int64_t num_leaves = static_cast<int64_t>(1) << tree_depth;
+
+        for (int64_t leaf = 0; leaf < num_leaves; ++leaf) {
+            const int64_t patch_idx = leaf_indices[oc][leaf];
+            const int64_t kw = patch_idx % kernel_w;
+            const int64_t kh = (patch_idx / kernel_w) % kernel_h;
+            const int64_t ic = patch_idx / (kernel_h * kernel_w);
+            const int64_t ih = oh * stride_h + kh * dilation_h - padding_h;
+            const int64_t iw = ow * stride_w + kw * dilation_w - padding_w;
+
+            if (ih >= 0 && ih < in_h && iw >= 0 && iw < in_w) {
+                values[leaf] = x[batch][ic][ih][iw];
+            } else {
+                values[leaf] = static_cast<scalar_t>(0);
+            }
+        }
+
+        int64_t gate_offset = 0;
+        int64_t current_count = num_leaves;
+        for (int64_t level = 0; level < tree_depth; ++level) {
+            const int64_t gates_at_level = current_count / 2;
+            for (int64_t gate = 0; gate < gates_at_level; ++gate) {
+                const scalar_t a_ = values[2 * gate];
+                const scalar_t b_ = values[2 * gate + 1];
+                const auto w_ = w[oc][gate_offset + gate];
+                values[gate] = bin_op_soft(a_, b_, &w_[0]);
+            }
+            gate_offset += gates_at_level;
+            current_count = gates_at_level;
+        }
+
+        y[batch][oc][oh][ow] = values[0];
+    }
+}
+
+torch::Tensor conv_logic_tree_cuda_forward(
+    torch::Tensor x,
+    torch::Tensor leaf_indices,
+    torch::Tensor w,
+    const int64_t kernel_h,
+    const int64_t kernel_w,
+    const int64_t stride_h,
+    const int64_t stride_w,
+    const int64_t padding_h,
+    const int64_t padding_w,
+    const int64_t dilation_h,
+    const int64_t dilation_w,
+    const int64_t tree_depth
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(leaf_indices);
+    CHECK_INPUT(w);
+
+    TORCH_CHECK(x.dim() == 4, "x must be a 4D NCHW tensor");
+    TORCH_CHECK(leaf_indices.dim() == 2, "leaf_indices must be a 2D tensor");
+    TORCH_CHECK(w.dim() == 3, "w must be a 3D tensor");
+    TORCH_CHECK(tree_depth >= 1, "tree_depth must be >= 1");
+
+    const int64_t num_leaves = static_cast<int64_t>(1) << tree_depth;
+    TORCH_CHECK(
+        num_leaves <= MAX_CONV_LOGIC_TREE_LEAVES,
+        "CUDA ConvLogicTreeLayer currently supports tree_depth <= 6");
+    TORCH_CHECK(leaf_indices.size(1) == num_leaves, "leaf_indices second dim must equal 2 ** tree_depth");
+    TORCH_CHECK(w.size(0) == leaf_indices.size(0), "w and leaf_indices must agree on out_channels");
+    TORCH_CHECK(w.size(1) == num_leaves - 1, "w second dim must equal 2 ** tree_depth - 1");
+    TORCH_CHECK(w.size(2) == 16, "w last dim must be 16");
+
+    const int64_t batch_size = x.size(0);
+    const int64_t out_channels = leaf_indices.size(0);
+    const int64_t in_h = x.size(2);
+    const int64_t in_w = x.size(3);
+    const int64_t out_h = (in_h + 2 * padding_h - dilation_h * (kernel_h - 1) - 1) / stride_h + 1;
+    const int64_t out_w = (in_w + 2 * padding_w - dilation_w * (kernel_w - 1) - 1) / stride_w + 1;
+    TORCH_CHECK(out_h > 0 && out_w > 0, "convolution output size must be positive");
+
+    auto y = torch::empty({batch_size, out_channels, out_h, out_w}, torch::dtype(x.dtype()).device(x.device()));
+
+    const int threads_per_block = 256;
+    const int64_t total = batch_size * out_channels * out_h * out_w;
+    const int blocks_per_grid = min(static_cast<int64_t>(65535), ceil_div(total, static_cast<int64_t>(threads_per_block)));
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.type(), "conv_logic_tree_cuda_forward", ([&] {
+                           conv_logic_tree_cuda_forward_kernel<scalar_t><<<blocks_per_grid, threads_per_block>>>(
+                               x.packed_accessor64<scalar_t, 4, torch::RestrictPtrTraits>(),
+                               leaf_indices.packed_accessor64<int64_t, 2, torch::RestrictPtrTraits>(),
+                               w.packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>(),
+                               y.packed_accessor64<scalar_t, 4, torch::RestrictPtrTraits>(),
+                               kernel_h,
+                               kernel_w,
+                               stride_h,
+                               stride_w,
+                               padding_h,
+                               padding_w,
+                               dilation_h,
+                               dilation_w,
+                               tree_depth);
+                       }));
+
+    CUDA_KERNEL_CHECK();
+
+    return y;
+}
+
+
 
 
 /**********************************************************************************************************************/

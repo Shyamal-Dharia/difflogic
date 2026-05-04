@@ -44,7 +44,7 @@ class ConvLogicTreeLayer(torch.nn.Module):
         :param dilation:      convolution dilation
         :param device:        device for parameters and connection indices
         :param grad_factor:   gradient multiplier applied to the input
-        :param implementation: currently only 'python'
+        :param implementation: implementation to use (options: 'cuda' / 'python'). CUDA is forward-only for now.
         :param connections:   currently only 'random'
         :param residual_init: initialize gates toward the identity operation A
         """
@@ -66,7 +66,7 @@ class ConvLogicTreeLayer(torch.nn.Module):
         if implementation is None:
             implementation = 'python'
         self.implementation = implementation
-        assert self.implementation == 'python', 'ConvLogicTreeLayer currently only supports implementation="python".'
+        assert self.implementation in ['cuda', 'python'], self.implementation
         assert self.connections == 'random', 'ConvLogicTreeLayer currently only supports connections="random".'
         assert self.tree_depth >= 1, self.tree_depth
 
@@ -85,14 +85,18 @@ class ConvLogicTreeLayer(torch.nn.Module):
         self.num_weights = out_channels * self.num_tree_gates
 
     def forward(self, x):
-        assert self.implementation == 'python', self.implementation
         assert x.ndim == 4, x.ndim
         assert x.shape[1] == self.in_channels, (x.shape, self.in_channels)
 
         if self.grad_factor != 1.:
             x = GradFactor.apply(x, self.grad_factor)
 
-        return self.forward_python(x)
+        if self.implementation == 'cuda':
+            return self.forward_cuda(x)
+        elif self.implementation == 'python':
+            return self.forward_python(x)
+        else:
+            raise ValueError(self.implementation)
 
     def forward_python(self, x):
         batch_size, _, height, width = x.shape
@@ -125,6 +129,39 @@ class ConvLogicTreeLayer(torch.nn.Module):
 
         y = current.squeeze(-1).reshape(batch_size, out_h, out_w, self.out_channels)
         return y.permute(0, 3, 1, 2).contiguous()
+
+    def forward_cuda(self, x):
+        assert x.device.type == 'cuda', x.device
+
+        if self.training and torch.is_grad_enabled() and (x.requires_grad or self.weights.requires_grad):
+            raise RuntimeError(
+                'ConvLogicTreeLayer implementation="cuda" currently supports forward-only checks. '
+                'Use implementation="python" for training until CUDA backward is added.'
+            )
+
+        x = x.contiguous()
+        leaf_indices = self.leaf_indices.contiguous()
+
+        if self.training:
+            weights = torch.nn.functional.softmax(self.weights, dim=-1).to(x.dtype)
+        else:
+            weights = torch.nn.functional.one_hot(self.weights.argmax(-1), 16).to(x.dtype)
+        weights = weights.contiguous()
+
+        return difflogic_cuda.conv_logic_tree_forward(
+            x,
+            leaf_indices,
+            weights,
+            self.kernel_size[0],
+            self.kernel_size[1],
+            self.stride[0],
+            self.stride[1],
+            self.padding[0],
+            self.padding[1],
+            self.dilation[0],
+            self.dilation[1],
+            self.tree_depth,
+        )
 
     def get_leaf_connections(self, patch_dim, device='cuda'):
         if self.num_leaves <= patch_dim:
