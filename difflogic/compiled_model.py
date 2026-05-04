@@ -361,11 +361,10 @@ void apply_logic_gate_net (bool const *inp, {BITS_TO_DTYPE[32]} *out, size_t len
 
         self.lib_fn(x, out, batch_size_div_bits)
 
-        out = torch.tensor(out).view(batch_size_div_bits * self.num_bits, self.num_classes)
+        out = torch.from_numpy(out).view(batch_size_div_bits * self.num_bits, self.num_classes)
         if pad_len > 0:
             out = out[:-pad_len]
         if verbose:
             print('out.shape', out.shape)
 
         return out
-

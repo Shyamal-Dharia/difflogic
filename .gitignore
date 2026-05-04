@@ -1,0 +1,29 @@
+# Local development notes
+AGENTS.md
+changes/
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Compiled native extensions
+*.so
+
+# Test/cache artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor/OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp

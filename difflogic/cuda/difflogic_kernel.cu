@@ -27,6 +27,18 @@ inline void gpuAssert(const cudaError_t code, const char *const file, const int 
     }
 }
 
+#ifdef DIFFLOGIC_CUDA_DEBUG_SYNC
+#define DIFFLOGIC_CUDA_DEBUG_SYNC_IF_ENABLED() gpuErrchk(cudaDeviceSynchronize())
+#else
+#define DIFFLOGIC_CUDA_DEBUG_SYNC_IF_ENABLED()
+#endif
+
+#define CUDA_KERNEL_CHECK()                                                                                            \
+    do {                                                                                                               \
+        gpuErrchk(cudaPeekAtLastError());                                                                              \
+        DIFFLOGIC_CUDA_DEBUG_SYNC_IF_ENABLED();                                                                        \
+    } while (0)
+
 template <typename T> T ceil_div(const T x, const T y) { return x / y + !!(x % y); }
 
 
@@ -290,8 +302,7 @@ torch::Tensor logic_layer_cuda_forward(
                            );
                        }));
 
-    gpuErrchk(cudaPeekAtLastError());
-    gpuErrchk(cudaDeviceSynchronize());
+    CUDA_KERNEL_CHECK();
 
     return y;
 }
@@ -331,8 +342,7 @@ torch::Tensor logic_layer_cuda_backward_w(
                                grad_w_4.packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>());
                        }));
 
-    gpuErrchk(cudaPeekAtLastError());
-    gpuErrchk(cudaDeviceSynchronize());
+    CUDA_KERNEL_CHECK();
 
     const auto grad_w_components = grad_w_4.sum(1);
     const auto grad_w_ab = grad_w_components.index({torch::indexing::Slice(), 0});
@@ -403,8 +413,7 @@ torch::Tensor logic_layer_cuda_backward_x(
                            );
                        }));
 
-    gpuErrchk(cudaPeekAtLastError());
-    gpuErrchk(cudaDeviceSynchronize());
+    CUDA_KERNEL_CHECK();
 
     return grad_x;
 }
@@ -515,7 +524,7 @@ torch::Tensor logic_layer_cuda_eval(
     const auto in_size = x.size(0);
     const auto out_size = w.size(0);
 
-    auto y = torch::zeros({out_size, batch_size}, torch::dtype(x.dtype()).device(x.device()));
+    auto y = torch::empty({out_size, batch_size}, torch::dtype(x.dtype()).device(x.device()));
 
     dim3 threads_per_block(32, 32);
 
@@ -534,8 +543,7 @@ torch::Tensor logic_layer_cuda_eval(
                                    );
                                }));
 
-    gpuErrchk(cudaPeekAtLastError());
-    gpuErrchk(cudaDeviceSynchronize());
+    CUDA_KERNEL_CHECK();
 
     return y;
 }
@@ -618,8 +626,7 @@ std::tuple<torch::Tensor, int> tensor_packbits_cuda(
                                    tensor_packbits_cuda_kernel<scalar_t><<<blocks_per_grid, threads_per_block>>>(t.packed_accessor32<bool, 2, torch::RestrictPtrTraits>(),
                                                                                                                             b.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>());
                                }));
-    gpuErrchk(cudaPeekAtLastError());
-    gpuErrchk(cudaDeviceSynchronize());
+    CUDA_KERNEL_CHECK();
 
     return {b, pad_len};
 }
@@ -685,7 +692,7 @@ torch::Tensor groupbitsum(
         min(static_cast<int64_t>(65535), ceil_div(out_size, static_cast<int64_t>(threads_per_block.y)))
     );
 
-    auto t = torch::zeros({out_size, batch_out_size}, torch::dtype(torch::kInt32).device(b.device()));
+    auto t = torch::empty({out_size, batch_out_size}, torch::dtype(torch::kInt32).device(b.device()));
 
     AT_DISPATCH_INTEGRAL_TYPES(b.type(), "groupbitsum_kernel", ([&] {
                                    groupbitsum_kernel<scalar_t><<<blocks_per_grid, threads_per_block>>>(
@@ -693,12 +700,10 @@ torch::Tensor groupbitsum(
                                         t.packed_accessor32<int, 2, torch::RestrictPtrTraits>()
                                         );
                                }));
-    gpuErrchk(cudaPeekAtLastError());
-    gpuErrchk(cudaDeviceSynchronize());
+    CUDA_KERNEL_CHECK();
 
     return t.transpose(0, 1).contiguous();
 }
 
 
 /**********************************************************************************************************************/
-
