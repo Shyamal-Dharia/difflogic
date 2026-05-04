@@ -21,6 +21,8 @@ def main():
         reference_cmd.append('--skip-timing')
     run(reference_cmd)
 
+    run([sys.executable, 'validation/conv_logic_concat_residual_check.py', '--device', args.device])
+
     run([sys.executable, 'validation/binary_example_check.py', '--device', args.device])
 
 
