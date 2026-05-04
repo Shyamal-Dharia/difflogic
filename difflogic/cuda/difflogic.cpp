@@ -41,6 +41,20 @@ torch::Tensor groupbitsum(
     const int pad_len,
     const int k
 );
+torch::Tensor conv_logic_tree_cuda_forward(
+    torch::Tensor x,
+    torch::Tensor leaf_indices,
+    torch::Tensor w,
+    const int64_t kernel_h,
+    const int64_t kernel_w,
+    const int64_t stride_h,
+    const int64_t stride_w,
+    const int64_t padding_h,
+    const int64_t padding_w,
+    const int64_t dilation_h,
+    const int64_t dilation_w,
+    const int64_t tree_depth
+);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
@@ -81,4 +95,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             return groupbitsum(b, pad_len, k);
         },
         "groupbitsum (CUDA)");
+    m.def(
+        "conv_logic_tree_forward",
+        [](torch::Tensor x, torch::Tensor leaf_indices, torch::Tensor w, const int64_t kernel_h,
+           const int64_t kernel_w, const int64_t stride_h, const int64_t stride_w, const int64_t padding_h,
+           const int64_t padding_w, const int64_t dilation_h, const int64_t dilation_w, const int64_t tree_depth) {
+            return conv_logic_tree_cuda_forward(
+                x,
+                leaf_indices,
+                w,
+                kernel_h,
+                kernel_w,
+                stride_h,
+                stride_w,
+                padding_h,
+                padding_w,
+                dilation_h,
+                dilation_w,
+                tree_depth);
+        },
+        "convolutional logic tree forward (CUDA)");
 }

@@ -103,7 +103,7 @@ def run_seed(seed, device):
     if device == 'cuda':
         torch.cuda.synchronize()
 
-    return {
+    row = {
         'seed': seed,
         'train_max_abs_diff': train_max_abs_diff,
         'eval_max_abs_diff': eval_max_abs_diff,
@@ -111,6 +111,69 @@ def run_seed(seed, device):
         'train_output_sum': float(y.detach().sum().cpu()),
         'eval_output_sum': float(y_eval.detach().sum().cpu()),
         'weight_grad_sum': float(layer.weights.grad.detach().sum().cpu()),
+    }
+    if device == 'cuda':
+        row.update(run_cuda_forward_seed(seed))
+    return row
+
+
+def run_cuda_forward_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    layer_python = difflogic.ConvLogicTreeLayer(
+        in_channels=2,
+        out_channels=3,
+        kernel_size=3,
+        tree_depth=2,
+        padding=1,
+        device='cuda',
+        implementation='python',
+    )
+    layer_cuda = difflogic.ConvLogicTreeLayer(
+        in_channels=2,
+        out_channels=3,
+        kernel_size=3,
+        tree_depth=2,
+        padding=1,
+        device='cuda',
+        implementation='cuda',
+    )
+    layer_cuda.leaf_indices.copy_(layer_python.leaf_indices)
+    layer_cuda.weights.data.copy_(layer_python.weights.data)
+
+    x = torch.rand(2, 2, 4, 5, device='cuda')
+
+    layer_python.train()
+    layer_cuda.train()
+    with torch.no_grad():
+        y_python_train = layer_python(x)
+        y_cuda_train = layer_cuda(x)
+    cuda_train_max_abs_diff = float((y_python_train - y_cuda_train).abs().max().cpu())
+    assert cuda_train_max_abs_diff < 1e-6, cuda_train_max_abs_diff
+
+    x_requires_grad = x.detach().requires_grad_(True)
+    try:
+        layer_cuda(x_requires_grad)
+        raise AssertionError('CUDA ConvLogicTreeLayer training should fail while backward is not implemented.')
+    except RuntimeError as err:
+        assert 'forward-only' in str(err), str(err)
+
+    layer_python.eval()
+    layer_cuda.eval()
+    with torch.no_grad():
+        y_python_eval = layer_python(x)
+        y_cuda_eval = layer_cuda(x)
+    cuda_eval_max_abs_diff = float((y_python_eval - y_cuda_eval).abs().max().cpu())
+    assert cuda_eval_max_abs_diff < 1e-6, cuda_eval_max_abs_diff
+
+    torch.cuda.synchronize()
+
+    return {
+        'cuda_train_max_abs_diff_vs_python': cuda_train_max_abs_diff,
+        'cuda_eval_max_abs_diff_vs_python': cuda_eval_max_abs_diff,
+        'cuda_train_output_sum': float(y_cuda_train.sum().cpu()),
+        'cuda_eval_output_sum': float(y_cuda_eval.sum().cpu()),
     }
 
 
@@ -155,6 +218,78 @@ def run_timing(seeds, device):
     }
 
 
+def run_cuda_forward_timing(seeds):
+    rows = []
+    warmup = 10
+    iterations = 50
+    for seed in seeds:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+        layer_python = difflogic.ConvLogicTreeLayer(
+            3,
+            16,
+            3,
+            tree_depth=3,
+            padding=1,
+            device='cuda',
+            implementation='python',
+        ).eval()
+        layer_cuda = difflogic.ConvLogicTreeLayer(
+            3,
+            16,
+            3,
+            tree_depth=3,
+            padding=1,
+            device='cuda',
+            implementation='cuda',
+        ).eval()
+        layer_cuda.leaf_indices.copy_(layer_python.leaf_indices)
+        layer_cuda.weights.data.copy_(layer_python.weights.data)
+        x = torch.rand(8, 3, 32, 32, device='cuda')
+
+        with torch.no_grad():
+            for _ in range(warmup):
+                y_python = layer_python(x)
+                y_cuda = layer_cuda(x)
+        torch.cuda.synchronize()
+
+        with torch.no_grad():
+            start = time.perf_counter()
+            for _ in range(iterations):
+                y_python = layer_python(x)
+            torch.cuda.synchronize()
+            python_elapsed = time.perf_counter() - start
+
+            start = time.perf_counter()
+            for _ in range(iterations):
+                y_cuda = layer_cuda(x)
+            torch.cuda.synchronize()
+            cuda_elapsed = time.perf_counter() - start
+
+        max_abs_diff = float((y_python - y_cuda).abs().max().cpu())
+        assert max_abs_diff < 1e-6, max_abs_diff
+
+        python_ms = python_elapsed / iterations * 1000
+        cuda_ms = cuda_elapsed / iterations * 1000
+        rows.append({
+            'seed': seed,
+            'python_ms_per_iter': python_ms,
+            'cuda_ms_per_iter': cuda_ms,
+            'speedup': python_ms / cuda_ms,
+            'max_abs_diff': max_abs_diff,
+        })
+
+    return {
+        'warmup': warmup,
+        'iterations': iterations,
+        'mean_python_ms_per_iter': statistics.mean(row['python_ms_per_iter'] for row in rows),
+        'mean_cuda_ms_per_iter': statistics.mean(row['cuda_ms_per_iter'] for row in rows),
+        'mean_speedup': statistics.mean(row['speedup'] for row in rows),
+        'rows': rows,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', choices=['cpu', 'cuda'], default='cpu')
@@ -173,6 +308,8 @@ def main():
     }
     if not args.skip_timing:
         result['timing'] = run_timing(args.seeds, args.device)
+        if args.device == 'cuda':
+            result['cuda_forward_timing'] = run_cuda_forward_timing(args.seeds)
     print(json.dumps(result, indent=2))
 
 
