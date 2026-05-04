@@ -152,13 +152,6 @@ def run_cuda_forward_seed(seed):
     cuda_train_max_abs_diff = float((y_python_train - y_cuda_train).abs().max().cpu())
     assert cuda_train_max_abs_diff < 1e-6, cuda_train_max_abs_diff
 
-    x_requires_grad = x.detach().requires_grad_(True)
-    try:
-        layer_cuda(x_requires_grad)
-        raise AssertionError('CUDA ConvLogicTreeLayer training should fail while backward is not implemented.')
-    except RuntimeError as err:
-        assert 'forward-only' in str(err), str(err)
-
     layer_python.eval()
     layer_cuda.eval()
     with torch.no_grad():
@@ -174,6 +167,83 @@ def run_cuda_forward_seed(seed):
         'cuda_eval_max_abs_diff_vs_python': cuda_eval_max_abs_diff,
         'cuda_train_output_sum': float(y_cuda_train.sum().cpu()),
         'cuda_eval_output_sum': float(y_cuda_eval.sum().cpu()),
+        **run_cuda_backward_seed(seed),
+    }
+
+
+def run_cuda_backward_seed(seed):
+    configs = [
+        {'kernel_size': 3, 'tree_depth': 2, 'padding': 1, 'stride': 1, 'dilation': 1, 'shape': (2, 2, 4, 5)},
+        {'kernel_size': 2, 'tree_depth': 1, 'padding': 0, 'stride': 2, 'dilation': 1, 'shape': (2, 2, 6, 7)},
+        {'kernel_size': 3, 'tree_depth': 2, 'padding': 2, 'stride': 1, 'dilation': 2, 'shape': (1, 2, 7, 8)},
+    ]
+
+    cuda_backward_output_max_abs_diff = 0.
+    cuda_grad_x_max_abs_diff = 0.
+    cuda_grad_weights_max_abs_diff = 0.
+
+    for config_idx, config in enumerate(configs):
+        torch.manual_seed(seed + config_idx)
+        torch.cuda.manual_seed_all(seed + config_idx)
+
+        layer_python = difflogic.ConvLogicTreeLayer(
+            in_channels=2,
+            out_channels=3,
+            kernel_size=config['kernel_size'],
+            tree_depth=config['tree_depth'],
+            padding=config['padding'],
+            stride=config['stride'],
+            dilation=config['dilation'],
+            device='cuda',
+            implementation='python',
+        ).train()
+        layer_cuda = difflogic.ConvLogicTreeLayer(
+            in_channels=2,
+            out_channels=3,
+            kernel_size=config['kernel_size'],
+            tree_depth=config['tree_depth'],
+            padding=config['padding'],
+            stride=config['stride'],
+            dilation=config['dilation'],
+            device='cuda',
+            implementation='cuda',
+        ).train()
+        layer_cuda.leaf_indices.copy_(layer_python.leaf_indices)
+        layer_cuda.weights.data.copy_(layer_python.weights.data)
+
+        x_python = torch.rand(*config['shape'], device='cuda', requires_grad=True)
+        x_cuda = x_python.detach().clone().requires_grad_(True)
+
+        y_python = layer_python(x_python)
+        y_cuda = layer_cuda(x_cuda)
+        grad_out = torch.randn_like(y_python)
+
+        (y_python * grad_out).sum().backward()
+        (y_cuda * grad_out).sum().backward()
+
+        cuda_backward_output_max_abs_diff = max(
+            cuda_backward_output_max_abs_diff,
+            float((y_python - y_cuda).abs().max().detach().cpu()),
+        )
+        cuda_grad_x_max_abs_diff = max(
+            cuda_grad_x_max_abs_diff,
+            float((x_python.grad - x_cuda.grad).abs().max().detach().cpu()),
+        )
+        cuda_grad_weights_max_abs_diff = max(
+            cuda_grad_weights_max_abs_diff,
+            float((layer_python.weights.grad - layer_cuda.weights.grad).abs().max().detach().cpu()),
+        )
+
+    assert cuda_backward_output_max_abs_diff < 1e-6, cuda_backward_output_max_abs_diff
+    assert cuda_grad_x_max_abs_diff < 2e-5, cuda_grad_x_max_abs_diff
+    assert cuda_grad_weights_max_abs_diff < 2e-5, cuda_grad_weights_max_abs_diff
+
+    torch.cuda.synchronize()
+
+    return {
+        'cuda_backward_output_max_abs_diff_vs_python': cuda_backward_output_max_abs_diff,
+        'cuda_grad_x_max_abs_diff_vs_python': cuda_grad_x_max_abs_diff,
+        'cuda_grad_weights_max_abs_diff_vs_python': cuda_grad_weights_max_abs_diff,
     }
 
 
@@ -290,6 +360,91 @@ def run_cuda_forward_timing(seeds):
     }
 
 
+def run_cuda_training_timing(seeds):
+    rows = []
+    warmup = 5
+    iterations = 20
+    for seed in seeds:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+        layer_python = difflogic.ConvLogicTreeLayer(
+            3,
+            8,
+            3,
+            tree_depth=3,
+            padding=1,
+            device='cuda',
+            implementation='python',
+        ).train()
+        layer_cuda = difflogic.ConvLogicTreeLayer(
+            3,
+            8,
+            3,
+            tree_depth=3,
+            padding=1,
+            device='cuda',
+            implementation='cuda',
+        ).train()
+        layer_cuda.leaf_indices.copy_(layer_python.leaf_indices)
+        layer_cuda.weights.data.copy_(layer_python.weights.data)
+        x_python = torch.rand(4, 3, 16, 16, device='cuda', requires_grad=True)
+        x_cuda = x_python.detach().clone().requires_grad_(True)
+
+        for _ in range(warmup):
+            y_python = layer_python(x_python)
+            loss_python = y_python.mean()
+            loss_python.backward()
+            layer_python.zero_grad(set_to_none=True)
+            x_python.grad = None
+
+            y_cuda = layer_cuda(x_cuda)
+            loss_cuda = y_cuda.mean()
+            loss_cuda.backward()
+            layer_cuda.zero_grad(set_to_none=True)
+            x_cuda.grad = None
+
+        torch.cuda.synchronize()
+
+        start = time.perf_counter()
+        for _ in range(iterations):
+            y_python = layer_python(x_python)
+            loss_python = y_python.mean()
+            loss_python.backward()
+            layer_python.zero_grad(set_to_none=True)
+            x_python.grad = None
+        torch.cuda.synchronize()
+        python_elapsed = time.perf_counter() - start
+
+        start = time.perf_counter()
+        for _ in range(iterations):
+            y_cuda = layer_cuda(x_cuda)
+            loss_cuda = y_cuda.mean()
+            loss_cuda.backward()
+            layer_cuda.zero_grad(set_to_none=True)
+            x_cuda.grad = None
+        torch.cuda.synchronize()
+        cuda_elapsed = time.perf_counter() - start
+
+        python_ms = python_elapsed / iterations * 1000
+        cuda_ms = cuda_elapsed / iterations * 1000
+        rows.append({
+            'seed': seed,
+            'python_ms_per_iter': python_ms,
+            'cuda_ms_per_iter': cuda_ms,
+            'speedup': python_ms / cuda_ms,
+        })
+
+    return {
+        'warmup': warmup,
+        'iterations': iterations,
+        'mean_python_ms_per_iter': statistics.mean(row['python_ms_per_iter'] for row in rows),
+        'mean_cuda_ms_per_iter': statistics.mean(row['cuda_ms_per_iter'] for row in rows),
+        'mean_speedup': statistics.mean(row['speedup'] for row in rows),
+        'rows': rows,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', choices=['cpu', 'cuda'], default='cpu')
@@ -310,6 +465,7 @@ def main():
         result['timing'] = run_timing(args.seeds, args.device)
         if args.device == 'cuda':
             result['cuda_forward_timing'] = run_cuda_forward_timing(args.seeds)
+            result['cuda_training_timing'] = run_cuda_training_timing(args.seeds)
     print(json.dumps(result, indent=2))
 
 
