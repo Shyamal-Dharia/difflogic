@@ -8,6 +8,178 @@ from .packbitstensor import PackBitsTensor
 ########################################################################################################################
 
 
+def _pair(v):
+    if isinstance(v, tuple):
+        assert len(v) == 2, v
+        return v
+    return v, v
+
+
+class ConvLogicTreeLayer(torch.nn.Module):
+    """
+    Convolutional differentiable logic layer using a shared local logic gate tree.
+    """
+    def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            kernel_size: int,
+            tree_depth: int = 3,
+            stride: int = 1,
+            padding: int = 0,
+            dilation: int = 1,
+            device: str = 'cuda',
+            grad_factor: float = 1.,
+            implementation: str = None,
+            connections: str = 'random',
+            residual_init: bool = False,
+    ):
+        """
+        :param in_channels:   number of input channels
+        :param out_channels:  number of output channels
+        :param kernel_size:   local spatial kernel size
+        :param tree_depth:    depth of the binary logic tree; uses 2 ** tree_depth leaves
+        :param stride:        convolution stride
+        :param padding:       convolution padding
+        :param dilation:      convolution dilation
+        :param device:        device for parameters and connection indices
+        :param grad_factor:   gradient multiplier applied to the input
+        :param implementation: currently only 'python'
+        :param connections:   currently only 'random'
+        :param residual_init: initialize gates toward the identity operation A
+        """
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = _pair(kernel_size)
+        self.stride = _pair(stride)
+        self.padding = _pair(padding)
+        self.dilation = _pair(dilation)
+        self.tree_depth = tree_depth
+        self.num_leaves = 2 ** tree_depth
+        self.num_tree_gates = self.num_leaves - 1
+        self.device = device
+        self.grad_factor = grad_factor
+        self.connections = connections
+
+        if implementation is None:
+            implementation = 'python'
+        self.implementation = implementation
+        assert self.implementation == 'python', 'ConvLogicTreeLayer currently only supports implementation="python".'
+        assert self.connections == 'random', 'ConvLogicTreeLayer currently only supports connections="random".'
+        assert self.tree_depth >= 1, self.tree_depth
+
+        patch_dim = in_channels * self.kernel_size[0] * self.kernel_size[1]
+        self.patch_dim = patch_dim
+        self.register_buffer('leaf_indices', self.get_leaf_connections(patch_dim, device))
+
+        if residual_init:
+            weights = torch.zeros(out_channels, self.num_tree_gates, 16, device=device)
+            weights[..., 3] = 5.
+        else:
+            weights = torch.randn(out_channels, self.num_tree_gates, 16, device=device)
+        self.weights = torch.nn.parameter.Parameter(weights)
+
+        self.num_neurons = out_channels
+        self.num_weights = out_channels * self.num_tree_gates
+
+    def forward(self, x):
+        assert self.implementation == 'python', self.implementation
+        assert x.ndim == 4, x.ndim
+        assert x.shape[1] == self.in_channels, (x.shape, self.in_channels)
+
+        if self.grad_factor != 1.:
+            x = GradFactor.apply(x, self.grad_factor)
+
+        return self.forward_python(x)
+
+    def forward_python(self, x):
+        batch_size, _, height, width = x.shape
+        out_h = self._conv_out_size(height, self.kernel_size[0], self.stride[0], self.padding[0], self.dilation[0])
+        out_w = self._conv_out_size(width, self.kernel_size[1], self.stride[1], self.padding[1], self.dilation[1])
+        assert out_h > 0 and out_w > 0, (x.shape, self.kernel_size, self.stride, self.padding, self.dilation)
+
+        patches = torch.nn.functional.unfold(
+            x,
+            kernel_size=self.kernel_size,
+            dilation=self.dilation,
+            padding=self.padding,
+            stride=self.stride,
+        ).transpose(1, 2)
+
+        current = patches[:, :, self.leaf_indices]
+        if self.training:
+            weights = torch.nn.functional.softmax(self.weights, dim=-1).to(x.dtype)
+        else:
+            weights = torch.nn.functional.one_hot(self.weights.argmax(-1), 16).to(x.dtype)
+
+        gate_offset = 0
+        for _ in range(self.tree_depth):
+            gates_at_level = current.shape[-1] // 2
+            a = current[..., 0::2]
+            b = current[..., 1::2]
+            w = weights[:, gate_offset: gate_offset + gates_at_level]
+            current = bin_op_s(a, b, w)
+            gate_offset += gates_at_level
+
+        y = current.squeeze(-1).reshape(batch_size, out_h, out_w, self.out_channels)
+        return y.permute(0, 3, 1, 2).contiguous()
+
+    def get_leaf_connections(self, patch_dim, device='cuda'):
+        if self.num_leaves <= patch_dim:
+            indices = [torch.randperm(patch_dim)[:self.num_leaves] for _ in range(self.out_channels)]
+            indices = torch.stack(indices, dim=0)
+        else:
+            indices = torch.randint(0, patch_dim, (self.out_channels, self.num_leaves))
+        return indices.to(torch.int64).to(device)
+
+    @staticmethod
+    def _conv_out_size(size, kernel_size, stride, padding, dilation):
+        return (size + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1
+
+    def extra_repr(self):
+        return 'in_channels={}, out_channels={}, kernel_size={}, tree_depth={}, stride={}, padding={}'.format(
+            self.in_channels,
+            self.out_channels,
+            self.kernel_size,
+            self.tree_depth,
+            self.stride,
+            self.padding,
+        )
+
+
+########################################################################################################################
+
+
+class LogicORPool2d(torch.nn.Module):
+    """
+    Differentiable OR-style spatial pooling.
+    """
+    def __init__(self, kernel_size: int = 2, stride: int = None, padding: int = 0, dilation: int = 1):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+        self.dilation = dilation
+
+    def forward(self, x):
+        assert not isinstance(x, PackBitsTensor), 'LogicORPool2d does not support PackBitsTensor yet.'
+        return torch.nn.functional.max_pool2d(
+            x,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+        )
+
+    def extra_repr(self):
+        return 'kernel_size={}, stride={}, padding={}'.format(self.kernel_size, self.stride, self.padding)
+
+
+########################################################################################################################
+
+
 class LogicLayer(torch.nn.Module):
     """
     The core module for differentiable logic gate networks. Provides a differentiable logic gate layer.
