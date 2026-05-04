@@ -280,6 +280,151 @@ class LogicORPool2d(torch.nn.Module):
 ########################################################################################################################
 
 
+class ConvLogicConcatResidualStack(torch.nn.Module):
+    """
+    Stack of ConvLogicTreeLayer modules with optional concat residual skips.
+    """
+    def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            num_layers: int,
+            kernel_size: int,
+            tree_depth: int = 3,
+            stride: int = 1,
+            padding: int = 0,
+            dilation: int = 1,
+            pool_every: int = 0,
+            pool_kernel_size: int = 2,
+            pool_stride: int = None,
+            residual_distance: int = 2,
+            device: str = 'cuda',
+            grad_factor: float = 1.,
+            implementation: str = None,
+            residual_init: bool = True,
+    ):
+        """
+        :param in_channels: input channels for the first layer
+        :param out_channels: output channels for every layer in the stack
+        :param num_layers: number of ConvLogicTreeLayer modules
+        :param kernel_size: convolutional logic kernel size
+        :param tree_depth: depth of each local logic tree
+        :param stride: convolution stride for each ConvLogicTreeLayer
+        :param padding: convolution padding for each ConvLogicTreeLayer
+        :param dilation: convolution dilation for each ConvLogicTreeLayer
+        :param pool_every: insert OR pooling after every N layers; 0 disables pooling
+        :param pool_kernel_size: pooling kernel size
+        :param pool_stride: pooling stride; defaults to pool_kernel_size
+        :param residual_distance: layer distance for concat skips; 2 means layer 1 can skip to layer 3
+        :param device: device for parameters and connection indices
+        :param grad_factor: gradient multiplier passed to ConvLogicTreeLayer
+        :param implementation: ConvLogicTreeLayer implementation ('cuda' / 'python')
+        :param residual_init: initialize gates toward identity A
+        """
+        super().__init__()
+        assert num_layers >= 1, num_layers
+        assert residual_distance >= 1, residual_distance
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.num_layers = num_layers
+        self.kernel_size = _pair(kernel_size)
+        self.stride = _pair(stride)
+        self.padding = _pair(padding)
+        self.dilation = _pair(dilation)
+        self.pool_every = pool_every
+        self.residual_distance = residual_distance
+        self.device = device
+        self.implementation = implementation
+
+        layers = []
+        cur_channels = in_channels
+        for layer_idx in range(num_layers):
+            use_skip = layer_idx - residual_distance >= 0
+            layer_in_channels = cur_channels + out_channels if use_skip else cur_channels
+            layers.append(ConvLogicTreeLayer(
+                layer_in_channels,
+                out_channels,
+                kernel_size=self.kernel_size,
+                tree_depth=tree_depth,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+                device=device,
+                grad_factor=grad_factor,
+                implementation=implementation,
+                residual_init=residual_init,
+            ))
+            cur_channels = out_channels
+        self.layers = torch.nn.ModuleList(layers)
+        self.pool = LogicORPool2d(
+            kernel_size=pool_kernel_size,
+            stride=pool_stride,
+        ) if pool_every > 0 else None
+
+    def forward(self, x):
+        assert x.ndim == 4, x.ndim
+        history = []
+        for layer_idx, layer in enumerate(self.layers):
+            skip_idx = layer_idx - self.residual_distance
+            if skip_idx >= 0:
+                skip = self._match_spatial(history[skip_idx], x)
+                x = torch.cat([x, skip], dim=1)
+            x = layer(x)
+            should_pool = (
+                self.pool is not None
+                and (layer_idx + 1) % self.pool_every == 0
+                and layer_idx < len(self.layers) - 1
+            )
+            if should_pool:
+                x = self.pool(x)
+            history.append(x)
+        return x
+
+    @staticmethod
+    def _match_spatial(skip, current):
+        if skip.shape[-2:] == current.shape[-2:]:
+            return skip
+
+        skip_h, skip_w = skip.shape[-2:]
+        cur_h, cur_w = current.shape[-2:]
+        assert skip_h >= cur_h and skip_w >= cur_w, (skip.shape, current.shape)
+
+        if skip_h % cur_h == 0 and skip_w % cur_w == 0:
+            scale_h = skip_h // cur_h
+            scale_w = skip_w // cur_w
+            return torch.nn.functional.max_pool2d(
+                skip,
+                kernel_size=(scale_h, scale_w),
+                stride=(scale_h, scale_w),
+            )
+        return torch.nn.functional.adaptive_max_pool2d(skip, current.shape[-2:])
+
+    @property
+    def num_neurons(self):
+        return sum(layer.num_neurons for layer in self.layers)
+
+    @property
+    def num_weights(self):
+        return sum(layer.num_weights for layer in self.layers)
+
+    def extra_repr(self):
+        return (
+            'in_channels={}, out_channels={}, num_layers={}, kernel_size={}, '
+            'pool_every={}, residual_distance={}'
+        ).format(
+            self.in_channels,
+            self.out_channels,
+            self.num_layers,
+            self.kernel_size,
+            self.pool_every,
+            self.residual_distance,
+        )
+
+
+########################################################################################################################
+
+
 class LogicLayer(torch.nn.Module):
     """
     The core module for differentiable logic gate networks. Provides a differentiable logic gate layer.

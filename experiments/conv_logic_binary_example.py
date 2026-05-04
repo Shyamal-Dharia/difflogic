@@ -22,6 +22,7 @@ class BinaryConvLogicNet(torch.nn.Module):
             device='cpu',
     ):
         super().__init__()
+        conv_implementation = 'cuda' if device == 'cuda' else 'python'
         self.encoder = difflogic.ThermometerEncoding(
             num_bits=thermometer_bits,
             value_range=(0., 1.),
@@ -33,6 +34,7 @@ class BinaryConvLogicNet(torch.nn.Module):
             tree_depth=tree_depth,
             padding=1,
             device=device,
+            implementation=conv_implementation,
         )
         self.pool1 = difflogic.LogicORPool2d(2)
         self.conv2 = difflogic.ConvLogicTreeLayer(
@@ -42,6 +44,7 @@ class BinaryConvLogicNet(torch.nn.Module):
             tree_depth=tree_depth,
             padding=1,
             device=device,
+            implementation=conv_implementation,
         )
         self.pool2 = difflogic.LogicORPool2d(2)
         pooled_size = image_size // 4
